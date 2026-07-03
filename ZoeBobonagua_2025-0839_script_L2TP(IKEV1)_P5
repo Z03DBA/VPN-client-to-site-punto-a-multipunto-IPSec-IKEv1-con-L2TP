@@ -1,0 +1,172 @@
+PARTE 1: CONFIGURACIÓN DEL SERVIDOR (Router R1)
+Entra al modo de configuración global de tu Router Cisco (configure terminal) y pega este bloque completo:
+
+Plaintext
+! --- 1. DIRECCIONAMIENTO DE INTERFACES ---
+interface GigabitEthernet1/0
+ description ENLACE_INTERNET_PUBLICA
+ ip address 192.8.39.1 255.255.255.0
+ no shutdown
+!
+interface GigabitEthernet2/0
+ description LAN_INTERNA_CORPORATIVA
+ ip address 172.16.10.1 255.255.255.0
+ no shutdown
+
+! --- 2. IPSEC FASE 1 (ISAKMP IKEv1) ---
+crypto isakmp policy 10
+ encr aes 256
+ hash sha256
+ authentication pre-share
+ group 14
+!
+! Clave precompartida global para los usuarios remotos
+crypto isakmp key cisco123 address 0.0.0.0 0.0.0.0
+
+! --- 3. IPSEC FASE 2 (TRANSFORM-SET EN MODO TRANSPORTE) ---
+crypto ipsec transform-set L2TP_SET esp-aes 256 esp-sha256-hmac
+ mode transport
+!
+crypto dynamic-map DYN_L2TP_MAP 10
+ set transform-set L2TP_SET
+!
+crypto map L2TP_MAP 10 ipsec-isakmp dynamic DYN_L2TP_MAP
+!
+interface GigabitEthernet1/0
+ crypto map L2TP_MAP
+
+! --- 4. POOL DE DIRECCIONES IP Y USUARIOS DE ACCESO ---
+ip local pool L2TP_POOL 192.168.100.50 192.168.100.100
+!
+username zoe password vpnpassword123
+
+! --- 5. ACTIVACIÓN DE VPDN Y CONFIGURACIÓN L2TP/PPP ---
+vpdn enable
+!
+vpdn-group L2TP_SERVER_SERVER
+ accept-dialin
+  protocol l2tp
+  virtual-template 1
+ terminate-from local
+!
+interface Virtual-Template1
+ ip unnumbered GigabitEthernet2/0
+ peer default ip address pool L2TP_POOL
+ ppp authentication chap pap
+
+PARTE 2: CONFIGURACIÓN DEL HOST INTERNO (PC1 - VPCS)
+
+En la consola del nodo VPCS (PC1), introduce los siguientes comandos para configurar su direccionamiento IP y la puerta de enlace:
+
+Plaintext
+PC1> ip 172.16.10.100 255.255.255.0 172.16.10.1
+PC1> save
+
+
+PARTE 3: CONFIGURACIÓN DEL CLIENTE (Kali Linux)
+
+Para asegurarnos de que StrongSwan lea correctamente los archivos y no se quede en blanco (none), ejecutaremos los comandos de forma limpia y forzaremos la recarga del demonio de red.
+
+Paso A: Conectividad y descarga de paquetes (Modo Internet)
+Conecta temporalmente tu Kali a la Nube NAT de GNS3 para bajar las herramientas:
+
+Bash
+sudo apt update
+sudo apt install strongswan xl2tpd -y --fix-missing
+Paso B: Direccionamiento estático (Modo Laboratorio)
+Desconecta la Nube NAT. Conecta la interfaz eth0 de tu Kali al Switch S1 y aplica:
+
+Bash
+sudo ifconfig eth0 0.0.0.0
+sudo ip route flush dev eth0
+sudo ifconfig eth0 192.8.39.11 netmask 255.255.255.0 up
+sudo route add default gw 192.8.39.1 eth0
+Paso C: Inyección de Archivos de Configuración
+1. Definir la clave precompartida:
+
+Bash
+echo ': PSK "cisco123"' | sudo tee /etc/ipsec.secrets
+2. Configurar la directiva de conexiones IPsec (/etc/ipsec.conf):
+
+Bash
+sudo tee /etc/ipsec.conf << 'EOF'
+config setup
+    charondebug="ike 2, knl 2, cfg 2"
+
+conn cisco-l2tp
+    authby=secret
+    pfs=no
+    auto=add
+    keyexchange=ikev1
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=192.8.39.1
+    rightprotoport=17/1701
+    ike=aes256-sha256-modp2048!
+    esp=aes256-sha256!
+EOF
+3. Configurar el túnel L2TP (/etc/xl2tpd/xl2tpd.conf):
+
+Bash
+sudo tee /etc/xl2tpd/xl2tpd.conf << 'EOF'
+[lac cisco-vpn]
+lns = 192.8.39.1
+ppp debug = yes
+pppoptfile = /etc/ppp/options.l2tpd.client
+length bit = yes
+EOF
+4. Configurar las credenciales de autenticación PPP:
+
+Bash
+sudo mkdir -p /etc/ppp
+sudo tee /etc/ppp/options.l2tpd.client << 'EOF'
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+noccp
+noauth
+crtscts
+mtu 1410
+mru 1410
+nodefaultroute
+name zoe
+password vpnpassword123
+EOF
+Paso D: Encendido del túnel paso a paso
+Para obligar al kernel a leer las nuevas configuraciones y levantar el enlace, ejecuta estos comandos en orden:
+
+Bash
+# 1. Reiniciar demonios de fondo
+sudo systemctl restart strongswan-starter
+sudo systemctl restart xl2tpd
+
+# 2. Forzar recarga de base de datos interna de StrongSwan
+sudo ipsec rereadsecrets
+sudo ipsec reload
+
+# 3. Iniciar Fase 1 y 2 (IPsec)
+sudo ipsec up cisco-l2tp
+
+# 4. Iniciar marcado de usuario (L2TP)
+sudo sh -c 'echo "c cisco-vpn" > /var/run/xl2tpd/l2tp-control'
+
+
+PARTE 4: SECUENCIA DE VERIFICACIÓN 
+
+Para demostrar que todo funciona, realiza este procedimiento exacto en tu video:
+
+En Kali Linux, valida que se creó la interfaz del túnel:
+
+
+ifconfig ppp0
+En Kali Linux, inicia un ping infinito hacia la red interna corporativa para generar tráfico constante:
+
+Bash
+ping 172.16.10.100
+Mientras el ping corre, muévete a la consola de R1 y muestra las tablas activas:
+
+
+R1# show crypto isakmp sa
+R1# show vpdn session
+R1# show ip local pool L2TP_POOL
